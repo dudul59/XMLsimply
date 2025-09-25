@@ -1,13 +1,13 @@
-# app.py
 import streamlit as st
 import xml.etree.ElementTree as ET
 from collections import defaultdict
-import os
 import io
 import zipfile
+import traceback
+import pandas as pd
 
 # -----------------------------------------------------------------------------
-# --- VOS FONCTIONS DE TRAITEMENT (issues de votre script Colab) ---
+# --- VOS NOUVELLES FONCTIONS DE TRAITEMENT XML ---
 # -----------------------------------------------------------------------------
 
 def parse_float(text):
@@ -28,10 +28,13 @@ def simplify_murs(mur_collection):
         if de is None or di is None: continue
         for tag in ['enum_type_adjacence_id', 'enum_orientation_id', 'paroi_lourde', 'enum_type_isolation_id']:
             el = de.find(tag)
-            key_parts.append(el.text if el is not None else '')
+            key_parts.append(el.text if el is not None and el.text is not None else '')
         el = di.find('umur')
-        key_parts.append(el.text if el is not None else '')
+        key_parts.append(el.text if el is not None and el.text is not None else '')
         groups[tuple(key_parts)].append(mur)
+    
+    if not groups or len(mur_collection.findall('mur')) <=1:
+        return mur_collection, {}
 
     new_collection = ET.Element('mur_collection')
     ref_map = {}
@@ -65,9 +68,10 @@ def simplify_planchers_hauts(ph_collection):
     new_ph.find('.//reference').text = new_ref
     new_ph.find('.//description').text = "Ensemble toitures sur combles perdus"
     total_opaque = sum(parse_float(ph.find('.//surface_paroi_opaque').text) for ph in all_phs)
-    total_aiu = sum(parse_float(ph.find('.//surface_aiu').text) for ph in all_phs)
+    if all_phs[0].find('.//surface_aiu') is not None:
+      total_aiu = sum(parse_float(ph.find('.//surface_aiu').text) for ph in all_phs)
+      new_ph.find('.//surface_aiu').text = f"{total_aiu:.3f}"
     new_ph.find('.//surface_paroi_opaque').text = f"{total_opaque:.3f}"
-    new_ph.find('.//surface_aiu').text = f"{total_aiu:.3f}"
     new_collection.append(new_ph)
     for ph in all_phs:
         old_ref = ph.find('.//reference')
@@ -76,15 +80,19 @@ def simplify_planchers_hauts(ph_collection):
     return new_collection, ref_map
 
 def update_and_simplify_baies(collection, mur_ref_map):
+    if collection is None: return None
     new_collection = ET.Element('baie_vitree_collection')
     baies_par_nouveau_mur = defaultdict(list)
-    for baie in collection.findall('baie_vitree'):
+    
+    cloned_baies = [ET.fromstring(ET.tostring(baie)) for baie in collection.findall('baie_vitree')]
+    for baie in cloned_baies:
         ref_paroi = baie.find('.//reference_paroi')
         if ref_paroi is not None and ref_paroi.text in mur_ref_map:
             new_mur_ref = mur_ref_map[ref_paroi.text]
-            baie_clone = ET.fromstring(ET.tostring(baie))
-            baie_clone.find('.//reference_paroi').text = new_mur_ref
-            baies_par_nouveau_mur[new_mur_ref].append(baie_clone)
+            baie.find('.//reference_paroi').text = new_mur_ref
+            baies_par_nouveau_mur[new_mur_ref].append(baie)
+        else:
+            baies_par_nouveau_mur["unmapped"].append(baie)
 
     for _, baies in baies_par_nouveau_mur.items():
         groupes_baies = defaultdict(list)
@@ -98,7 +106,8 @@ def update_and_simplify_baies(collection, mur_ref_map):
                 new_baie = ET.fromstring(ET.tostring(baie_group[0]))
                 total_surface = sum(parse_float(b.find('.//surface_totale_baie').text) for b in baie_group)
                 new_baie.find('.//surface_totale_baie').text = f"{total_surface:.3f}"
-                new_baie.find('.//nb_baie').text = str(len(baie_group))
+                if new_baie.find('.//nb_baie') is not None:
+                  new_baie.find('.//nb_baie').text = str(len(baie_group))
                 new_baie.find('.//description').text = "Fenêtres groupées"
                 new_collection.append(new_baie)
             else:
@@ -106,79 +115,108 @@ def update_and_simplify_baies(collection, mur_ref_map):
     return new_collection
 
 def update_other_references(enveloppe, mur_ref_map):
-    for tag_name in ['porte', 'baie_vitree']:
-        for elem in enveloppe.findall(f'.//{tag_name}'):
-            ref_paroi = elem.find('.//reference_paroi')
-            if ref_paroi is not None and ref_paroi.text in mur_ref_map:
-                ref_paroi.text = mur_ref_map[ref_paroi.text]
-    for pt in enveloppe.findall('.//pont_thermique'):
-        ref1 = pt.find('.//reference_1')
-        if ref1 is not None and ref1.text in mur_ref_map:
-            ref1.text = mur_ref_map[ref1.text]
+    for tag_name in ['porte']:
+        collection = enveloppe.find(f'{tag_name}_collection')
+        if collection is not None:
+            for elem in collection.findall(f'.//{tag_name}'):
+                ref_paroi = elem.find('.//reference_paroi')
+                if ref_paroi is not None and ref_paroi.text in mur_ref_map:
+                    ref_paroi.text = mur_ref_map[ref_paroi.text]
+    
+    pt_collection = enveloppe.find('pont_thermique_collection')
+    if pt_collection is not None:
+        for pt in pt_collection.findall('.//pont_thermique'):
+            for ref_tag in ['reference_1', 'reference_2']:
+                ref = pt.find(f'.//{ref_tag}')
+                if ref is not None and ref.text in mur_ref_map:
+                    ref.text = mur_ref_map[ref.text]
 
-def simplify_dpe_xml(input_stream):
+def simplify_dpe_xml_streamlit(input_stream):
     """
-    Fonction principale modifiée pour lire un flux (stream) en entrée
-    et retourner l'arbre XML traité.
+    Fonction principale adaptée pour Streamlit:
+    - Prend un flux (stream) en entrée.
+    - Retourne l'arbre XML traité ET les données pour le rapport.
     """
     try:
-        tree = ET.parse(input_stream)
+        # Il faut cloner le flux pour le lire deux fois (parsing et comptage)
+        input_content = input_stream.read()
+        
+        # --- Étape 0: Compter les éléments AVANT simplification ---
+        tree_before = ET.parse(io.BytesIO(input_content))
+        enveloppe_before = tree_before.getroot().find('.//enveloppe')
+        counts_before = {
+            "Murs": len(enveloppe_before.findall('.//mur')),
+            "Planchers Bas": len(enveloppe_before.findall('.//plancher_bas')),
+            "Planchers Hauts": len(enveloppe_before.findall('.//plancher_haut')),
+            "Menuiseries": len(enveloppe_before.findall('.//baie_vitree')),
+            "Ponts Thermiques": len(enveloppe_before.findall('.//pont_thermique')),
+        }
+
+        # --- Début de la simplification ---
+        tree = ET.parse(io.BytesIO(input_content))
         root = tree.getroot()
         logement = root.find('logement')
-        if logement is None: return None
+        if logement is None: return None, None, None
         enveloppe = logement.find('enveloppe')
-        if enveloppe is None: return None
-
-        # --- Étape 1: Générer les nouvelles collections simplifiées ---
+        if enveloppe is None: return None, None, None
+        
         mur_ref_map = {}
-        new_mur_collection, new_ph_collection, new_baie_collection = None, None, None
+        new_mur_collection, new_ph_collection = None, None
 
         mur_collection = enveloppe.find('mur_collection')
         if mur_collection is not None:
-            new_mur_collection, mur_ref_map = simplify_murs(mur_collection)
+            new_mur_collection, mur_ref_map_murs = simplify_murs(mur_collection)
+            mur_ref_map.update(mur_ref_map_murs)
 
         ph_collection = enveloppe.find('plancher_haut_collection')
-        if ph_collection is not None and len(ph_collection.findall('plancher_haut')) > 1:
-            new_ph_collection, _ = simplify_planchers_hauts(ph_collection)
-
+        if ph_collection is not None:
+            new_ph_collection, mur_ref_map_ph = simplify_planchers_hauts(ph_collection)
+            mur_ref_map.update(mur_ref_map_ph)
+        
         baie_collection = enveloppe.find('baie_vitree_collection')
-        if baie_collection is not None:
-            new_baie_collection = update_and_simplify_baies(baie_collection, mur_ref_map)
-
-        # --- Étape 2: Mettre à jour les références ---
+        new_baie_collection = update_and_simplify_baies(baie_collection, mur_ref_map) if baie_collection is not None else None
+        
         update_other_references(enveloppe, mur_ref_map)
 
-        # --- Étape 3: Reconstruire l'élément <enveloppe> ---
         new_enveloppe = ET.Element('enveloppe')
-        children_tags_to_replace = {
+        collections_map = {
             'mur_collection': new_mur_collection,
             'plancher_haut_collection': new_ph_collection,
             'baie_vitree_collection': new_baie_collection
         }
         for child in list(enveloppe):
-            if child.tag in children_tags_to_replace and children_tags_to_replace[child.tag] is not None:
-                new_enveloppe.append(children_tags_to_replace[child.tag])
+            if child.tag in collections_map and collections_map[child.tag] is not None:
+                new_enveloppe.append(collections_map[child.tag])
             else:
                 new_enveloppe.append(child)
 
-        # --- Étape 4: Remplacer l'ancienne <enveloppe> ---
         logement.remove(enveloppe)
-        logement.append(new_enveloppe)
+        meteo = logement.find('meteo')
+        meteo_index = list(logement).index(meteo) if meteo is not None else 0
+        logement.insert(meteo_index + 1, new_enveloppe)
+        
+        # --- Étape 6: Compter les éléments APRÈS et retourner le rapport ---
+        counts_after = {
+            "Murs": len(new_enveloppe.findall('.//mur')),
+            "Planchers Bas": len(new_enveloppe.findall('.//plancher_bas')),
+            "Planchers Hauts": len(new_enveloppe.findall('.//plancher_haut')),
+            "Menuiseries": len(new_enveloppe.findall('.//baie_vitree')),
+            "Ponts Thermiques": len(new_enveloppe.findall('.//pont_thermique')),
+        }
+        return tree, counts_before, counts_after
 
-        return tree
-
-    except Exception as e:
-        st.error(f"Une erreur est survenue pendant la simplification : {e}")
-        return None
+    except Exception:
+        st.error(f"Erreur inattendue : {traceback.format_exc()}")
+        return None, None, None
 
 # --------------------------------------------------------------------------
 # --- INTERFACE DE L'APPLICATION STREAMLIT ---
 # --------------------------------------------------------------------------
 
-st.set_page_config(page_title="Simplificateur XML DPE", layout="centered")
+st.set_page_config(page_title="Simplificateur XML DPE", layout="wide")
 
-st.title("️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️- 🏡 Simplificateur de Fichiers XML DPE")
-st.write("Déposez un ou plusieurs fichiers XML d'audit énergétique pour les simplifier et les télécharger.")
+st.title("️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️️- 🏡 Simplificateur de Fichiers XML DPE")
+st.write("Déposez un ou plusieurs fichiers XML d'audit énergétique pour les simplifier, visualiser un rapport et les télécharger.")
 
 
 
@@ -194,34 +232,43 @@ if uploaded_files:
     
     if st.button("🚀 Lancer la simplification", type="primary"):
         zip_buffer = io.BytesIO()
+        all_reports_data = {}
         
         with st.spinner('Traitement en cours...'):
             with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
                 for uploaded_file in uploaded_files:
                     
-                    # Le fichier est lu en mémoire
-                    simplified_tree = simplify_dpe_xml(uploaded_file)
+                    simplified_tree, counts_before, counts_after = simplify_dpe_xml_streamlit(uploaded_file)
 
-                    if simplified_tree:
-                        # On crée un buffer en mémoire pour écrire le XML simplifié
+                    if simplified_tree and counts_before and counts_after:
+                        all_reports_data[uploaded_file.name] = (counts_before, counts_after)
+                        
                         output_buffer = io.BytesIO()
                         simplified_tree.write(output_buffer, encoding='UTF-8', xml_declaration=True)
                         output_buffer.seek(0)
                         
-                        # On génère le nouveau nom de fichier
                         new_filename = uploaded_file.name.rsplit('.', 1)[0] + '_simplifie.xml'
-                        
-                        # On ajoute le fichier simplifié à l'archive ZIP
                         zf.writestr(new_filename, output_buffer.getvalue())
-                        st.write(f"✅ {uploaded_file.name} traité avec succès.")
+
+        st.success("🎉 Simplification terminée !")
+
+        st.header("📊 Rapport de Simplification")
+        
+        # Affichage des rapports sous forme de tableaux
+        for filename, (before, after) in all_reports_data.items():
+            st.subheader(f"📄 Fichier : {filename}")
+            report_df = pd.DataFrame({
+                'Élément': list(before.keys()),
+                'Avant': list(before.values()),
+                'Après': list(after.values())
+            })
+            st.table(report_df.set_index('Élément'))
 
         # On prépare le ZIP pour le téléchargement
         zip_buffer.seek(0)
-
-        st.success("🎉 Simplification terminée !")
         
         st.download_button(
-            label="📥 Télécharger le fichier ZIP",
+            label="📥 Télécharger les fichiers simplifiés (.zip)",
             data=zip_buffer,
             file_name="resultats_simplifies.zip",
             mime="application/zip"
