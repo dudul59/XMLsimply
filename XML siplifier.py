@@ -1,10 +1,10 @@
+import streamlit as st
 import xml.etree.ElementTree as ET
 from collections import defaultdict
-import os
-import shutil
-from google.colab import files
+import io
+import zipfile
 import traceback
-
+import pandas as pd
 # --- Suivre ces étapes :
 # 1 / Dans la barre latérale gauche, cliquez sur l'icône Dossier (📁).
 # 2 / Créer un dossier "audits_a_traiter".
