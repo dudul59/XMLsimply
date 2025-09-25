@@ -4,10 +4,9 @@ from collections import defaultdict
 import io
 import zipfile
 import traceback
-import pandas as pd
 
 # -----------------------------------------------------------------------------
-# --- VOS FONCTIONS DE TRAITEMENT XML (AVEC RAPPORT DÉTAILLÉ) ---
+# --- VOS NOUVELLES FONCTIONS DE TRAITEMENT XML (AVEC RAPPORT ENCORE PLUS DÉTAILLÉ) ---
 # -----------------------------------------------------------------------------
 
 def parse_float(text):
@@ -50,7 +49,8 @@ def simplify_murs(mur_collection):
         total_opaque = sum(parse_float(m.find('.//surface_paroi_opaque').text) for m in murs)
         total_totale = sum(parse_float(m.find('.//surface_paroi_totale').text) for m in murs)
         new_mur.find('.//surface_paroi_opaque').text = f"{total_opaque:.3f}"
-        new_mur.find('.//surface_paroi_totale').text = f"{total_totale:.3f}"
+        if new_mur.find('.//surface_paroi_totale') is not None:
+            new_mur.find('.//surface_paroi_totale').text = f"{total_totale:.3f}"
         new_collection.append(new_mur)
         for mur in murs:
             old_ref = mur.find('.//reference')
@@ -60,7 +60,9 @@ def simplify_murs(mur_collection):
     return new_collection, ref_map
 
 def simplify_planchers_hauts(ph_collection):
+    if ph_collection is None: return None, {}
     all_phs = ph_collection.findall('plancher_haut')
+    if not all_phs: return ph_collection, {}
     new_collection = ET.Element('plancher_haut_collection')
     ref_map = {}
     new_ph = ET.fromstring(ET.tostring(all_phs[0]))
@@ -69,8 +71,8 @@ def simplify_planchers_hauts(ph_collection):
     new_ph.find('.//description').text = "Ensemble toitures sur combles perdus"
     total_opaque = sum(parse_float(ph.find('.//surface_paroi_opaque').text) for ph in all_phs)
     if all_phs[0].find('.//surface_aiu') is not None:
-      total_aiu = sum(parse_float(ph.find('.//surface_aiu').text) for ph in all_phs)
-      new_ph.find('.//surface_aiu').text = f"{total_aiu:.3f}"
+        total_aiu = sum(parse_float(ph.find('.//surface_aiu').text) for ph in all_phs)
+        new_ph.find('.//surface_aiu').text = f"{total_aiu:.3f}"
     new_ph.find('.//surface_paroi_opaque').text = f"{total_opaque:.3f}"
     new_collection.append(new_ph)
     for ph in all_phs:
@@ -89,7 +91,8 @@ def update_and_simplify_baies(collection, mur_ref_map):
         ref_paroi = baie.find('.//reference_paroi')
         new_mur_ref = mur_ref_map.get(ref_paroi.text if ref_paroi is not None else None)
         if new_mur_ref:
-            baie.find('.//reference_paroi').text = new_mur_ref
+            if ref_paroi is not None:
+                baie.find('.//reference_paroi').text = new_mur_ref
             baies_par_nouveau_mur[new_mur_ref].append(baie)
         else:
             baies_par_nouveau_mur["unmapped"].append(baie)
@@ -107,7 +110,7 @@ def update_and_simplify_baies(collection, mur_ref_map):
                 total_surface = sum(parse_float(b.find('.//surface_totale_baie').text) for b in baie_group)
                 new_baie.find('.//surface_totale_baie').text = f"{total_surface:.3f}"
                 if new_baie.find('.//nb_baie') is not None:
-                  new_baie.find('.//nb_baie').text = str(len(baie_group))
+                    new_baie.find('.//nb_baie').text = str(len(baie_group))
                 new_baie.find('.//description').text = "Fenêtres groupées"
                 new_collection.append(new_baie)
             else:
@@ -144,18 +147,34 @@ def simplify_dpe_xml_streamlit(input_stream):
         tree_before_parse = ET.parse(io.BytesIO(input_content))
         enveloppe_before = tree_before_parse.getroot().find('.//enveloppe')
         report_before = defaultdict(list)
+        orientation_map = {'1': 'Nord', '2': 'Est', '3': 'Sud', '4': 'Ouest', 'N/A': 'N/A'}
+        adjacence_map_report = {'1': 'Ext', '8': 'Int', '9': 'Int', '12': 'Combles', '5': 'Terre-plein', '6': 'Sous-sol/VS'}
+
         for mur in enveloppe_before.findall('.//mur'):
-            desc = mur.find('.//description').text
-            surf = parse_float(mur.find('.//surface_paroi_opaque').text)
-            report_before['Murs'].append(f"{desc} ({surf:.2f} m²)")
+            de = mur.find('donnee_entree')
+            desc = de.find('description').text
+            surf = parse_float(de.find('surface_paroi_opaque').text)
+            orient_id = de.findtext('enum_orientation_id', 'N/A')
+            adj_id = de.findtext('enum_type_adjacence_id', 'N/A')
+            orient_text = orientation_map.get(orient_id, '?')
+            adj_text = adjacence_map_report.get(adj_id, 'Autre')
+            report_before['Murs'].append(f"  - {desc} ({adj_text} | {orient_text} | {surf:.2f} m²)")
+
         for pb in enveloppe_before.findall('.//plancher_bas'):
-            desc = pb.find('.//description').text
-            surf = parse_float(pb.find('.//surface_paroi_opaque').text)
-            report_before['Planchers Bas'].append(f"{desc} ({surf:.2f} m²)")
+            de = pb.find('donnee_entree')
+            desc = de.find('description').text
+            surf = parse_float(de.find('surface_paroi_opaque').text)
+            adj_id = de.findtext('enum_type_adjacence_id', 'N/A')
+            adj_text = adjacence_map_report.get(adj_id, 'Autre')
+            report_before['Planchers Bas'].append(f"  - {desc} ({adj_text} | {surf:.2f} m²)")
+
         for ph in enveloppe_before.findall('.//plancher_haut'):
-            desc = ph.find('.//description').text
-            surf = parse_float(ph.find('.//surface_paroi_opaque').text)
-            report_before['Planchers Hauts'].append(f"{desc} ({surf:.2f} m²)")
+            de = ph.find('donnee_entree')
+            desc = de.find('description').text
+            surf = parse_float(de.find('surface_paroi_opaque').text)
+            adj_id = de.findtext('enum_type_adjacence_id', 'N/A')
+            adj_text = adjacence_map_report.get(adj_id, 'Autre')
+            report_before['Planchers Hauts'].append(f"  - {desc} ({adj_text} | {surf:.2f} m²)")
 
         # --- Début de la simplification ---
         tree = ET.parse(io.BytesIO(input_content))
@@ -205,15 +224,15 @@ def simplify_dpe_xml_streamlit(input_stream):
         for mur in new_enveloppe.findall('.//mur'):
             desc = mur.find('.//description').text
             surf = parse_float(mur.find('.//surface_paroi_opaque').text)
-            report_after['Murs'].append(f"{desc} ({surf:.2f} m²)")
+            report_after['Murs'].append(f"  - {desc} ({surf:.2f} m²)")
         for pb in new_enveloppe.findall('.//plancher_bas'):
             desc = pb.find('.//description').text
             surf = parse_float(pb.find('.//surface_paroi_opaque').text)
-            report_after['Planchers Bas'].append(f"{desc} ({surf:.2f} m²)")
+            report_after['Planchers Bas'].append(f"  - {desc} ({surf:.2f} m²)")
         for ph in new_enveloppe.findall('.//plancher_haut'):
             desc = ph.find('.//description').text
             surf = parse_float(ph.find('.//surface_paroi_opaque').text)
-            report_after['Planchers Hauts'].append(f"{desc} ({surf:.2f} m²)")
+            report_after['Planchers Hauts'].append(f"  - {desc} ({surf:.2f} m²)")
 
         return tree, report_before, report_after
 
